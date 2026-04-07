@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>AI-RAG 知识助手</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Microsoft YaHei", sans-serif;
+        margin: 24px;
+        color: #111827;
+      }
+      .wrap {
+        max-width: 980px;
+      }
+      .card {
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 14px;
+        margin-bottom: 16px;
+      }
+      h2 { margin: 0 0 12px 0; }
+      h3 { margin: 0 0 10px 0; }
+      textarea, input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 10px;
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+      }
+      textarea { min-height: 90px; }
+      .row { margin: 8px 0; }
+      .btn {
+        padding: 9px 12px;
+        border: 0;
+        border-radius: 8px;
+        color: #fff;
+        background: #2563eb;
+        cursor: pointer;
+      }
+      .chat-log {
+        min-height: 220px;
+        max-height: 360px;
+        overflow: auto;
+        background: #f9fafb;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        padding: 10px;
+      }
+      .msg { margin: 8px 0; white-space: pre-wrap; }
+      .user { color: #1d4ed8; }
+      .assistant { color: #065f46; }
+      .meta { color: #6b7280; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h2>AI-RAG 个人知识助手（LangChain + Chroma）</h2>
+
+      <div class="card">
+        <h3>导入知识（文本）</h3>
+        <div class="row"><input id="source" type="text" value="manual_input" placeholder="source 标识" /></div>
+        <div class="row"><textarea id="ingestText" placeholder="输入要导入到向量库的知识内容"></textarea></div>
+        <button class="btn" id="ingestTextBtn">导入文本</button>
+      </div>
+
+      <div class="card">
+        <h3>导入知识（文件）</h3>
+        <div class="row"><input id="fileInput" type="file" accept=".txt,.md" /></div>
+        <button class="btn" id="ingestFileBtn">上传并导入</button>
+      </div>
+
+      <div class="card">
+        <h3>对话</h3>
+        <div id="chatLog" class="chat-log"></div>
+        <div class="row"><textarea id="chatInput" placeholder="输入问题。包含“总结/要点/summary”会触发代码 Skill。"></textarea></div>
+        <button class="btn" id="chatBtn">发送</button>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      function addLog(text, role = "assistant") {
+        const el = document.createElement("div");
+        el.className = `msg ${role}`;
+        el.textContent = text;
+        $("chatLog").appendChild(el);
+        $("chatLog").scrollTop = $("chatLog").scrollHeight;
+      }
+
+      async function ingestText() {
+        const text = $("ingestText").value.trim();
+        const source = $("source").value.trim() || "manual_input";
+        if (!text) return addLog("请先输入要导入的文本。", "assistant");
+        const res = await fetch("/ingest/text", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, source })
+        });
+        const data = await res.json();
+        addLog(`[导入文本] ${JSON.stringify(data)}`, "assistant");
+      }
+
+      async function ingestFile() {
+        const f = $("fileInput").files[0];
+        if (!f) return addLog("请先选择文件。", "assistant");
+        const fd = new FormData();
+        fd.append("file", f);
+        const res = await fetch("/ingest/file", { method: "POST", body: fd });
+        const data = await res.json();
+        addLog(`[导入文件] ${JSON.stringify(data)}`, "assistant");
+      }
+
+      async function sendChat() {
+        const message = $("chatInput").value.trim();
+        if (!message) return;
+        addLog(`你：${message}`, "user");
+        $("chatInput").value = "";
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message })
+        });
+        const data = await res.json();
+        addLog(`助手：${data.answer || JSON.stringify(data)}`, "assistant");
+        addLog(`sources: ${(data.sources || []).join(", ")} | used_skill=${Boolean(data.used_skill)}`, "meta");
+      }
+
+      $("ingestTextBtn").addEventListener("click", ingestText);
+      $("ingestFileBtn").addEventListener("click", ingestFile);
+      $("chatBtn").addEventListener("click", sendChat);
+    </script>
+  </body>
+</html>

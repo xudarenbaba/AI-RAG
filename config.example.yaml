@@ -1,0 +1,25 @@
+use_rag: true
+use_consolidation: true
+
+llm:
+  provider: openai_compatible
+  model: deepseek-chat
+  api_key: "YOUR_API_KEY_HERE"
+  base_url: https://api.deepseek.com
+  temperature: 0.2
+  timeout_s: 60
+
+embeddings:
+  provider: huggingface
+  model: BAAI/bge-small-zh-v1.5
+  cache_dir: models
+  local_files_only: true
+
+vectorstore:
+  persist_dir: data/chroma
+  collection_name: rag_knowledge
+
+rag:
+  chunk_size: 500
+  chunk_overlap: 80
+  top_k: 4
