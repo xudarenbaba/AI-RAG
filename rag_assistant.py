@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -44,11 +46,27 @@ class RagAssistant:
 
         persist_dir = Path(vs_cfg.get("persist_dir", "data/chroma"))
         persist_dir.mkdir(parents=True, exist_ok=True)
-        self.vectorstore = Chroma(
-            collection_name=vs_cfg.get("collection_name", "rag_knowledge"),
-            persist_directory=str(persist_dir),
-            embedding_function=self.embeddings,
-        )
+        collection_name = vs_cfg.get("collection_name", "rag_knowledge")
+        try:
+            self.vectorstore = Chroma(
+                collection_name=collection_name,
+                persist_directory=str(persist_dir),
+                embedding_function=self.embeddings,
+            )
+        except Exception as e:
+            # 常见于 Chroma 升级后读取旧持久化目录失败（如缺少 _type 字段）
+            if "_type" not in str(e):
+                raise
+            backup_dir = persist_dir.with_name(f"{persist_dir.name}_backup")
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            shutil.move(str(persist_dir), str(backup_dir))
+            persist_dir.mkdir(parents=True, exist_ok=True)
+            self.vectorstore = Chroma(
+                collection_name=collection_name,
+                persist_directory=str(persist_dir),
+                embedding_function=self.embeddings,
+            )
 
         self.top_k = int(rag_cfg.get("top_k", 4))
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -64,10 +82,10 @@ class RagAssistant:
             timeout=int(llm_cfg.get("timeout_s", 60)),
         )
         self.summary_chain = self._build_summary_chain()
-        self.answer_chain = self._build_answer_chain()
         self.skill_planner_chain = self._build_skill_planner_chain()
         self.tools = self._build_tools()
         self.tool_map = {t.name: t for t in self.tools}
+        self.agent_executor = self._build_agent_executor()
 
     def ingest_text(self, text: str, source: str = "manual_input") -> int:
         text = (text or "").strip()
@@ -99,11 +117,6 @@ class RagAssistant:
         q = (query or "").lower()
         return any(k in q for k in keys)
 
-    def _should_summarize(self, query: str) -> bool:
-        keys = ["总结", "要点", "提炼", "清单", "summary", "summarize", "bullet"]
-        q = (query or "").lower()
-        return any(k in q for k in keys)
-
     def _build_summary_chain(self):
         summary_prompt = ChatPromptTemplate.from_messages(
             [
@@ -119,19 +132,6 @@ class RagAssistant:
             ]
         )
         return summary_prompt | self.llm | StrOutputParser()
-
-    def _build_answer_chain(self):
-        answer_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "你是一个RAG知识助手。请基于上下文回答问题。"
-                    "如果证据不足，请明确不确定并给出下一步建议。",
-                ),
-                ("human", "问题：{question}\n\n上下文：\n{context}"),
-            ]
-        )
-        return answer_prompt | self.llm | StrOutputParser()
 
     def _retrieve(self, query: str) -> tuple[list[str], list[str]]:
         docs = self.vectorstore.similarity_search(query, k=self.top_k)
@@ -210,17 +210,53 @@ class RagAssistant:
 
         return [search_knowledge, make_knowledge_card, run_code_skill]
 
-    def _qa_with_search_tool(self, question: str) -> dict[str, Any]:
-        obs = self.tool_map["search_knowledge"].invoke({"query": question})
-        try:
-            payload = json.loads(str(obs))
-        except json.JSONDecodeError:
-            payload = {"chunks": [], "sources": []}
-        chunks = [str(x) for x in payload.get("chunks", []) if str(x).strip()]
-        sources = [str(x) for x in payload.get("sources", []) if str(x).strip()]
-        context = "\n\n".join(chunks) if chunks else "（未检索到相关知识）"
-        answer = self.answer_chain.invoke({"question": question, "context": context}).strip()
-        return {"answer": answer or "暂时无法生成回答。", "sources": sources, "used_skill": False}
+    def _build_agent_executor(self) -> AgentExecutor:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是一个RAG Agent。你可以调用工具完成检索问答与总结。"
+                    "事实问答优先调用 search_knowledge；总结类问题优先调用 make_knowledge_card；"
+                    "仅在任务拆解/计划场景调用 run_code_skill。"
+                    "上下文不足时必须明确不确定，并给出下一步建议。",
+                ),
+                ("human", "{input}"),
+                MessagesPlaceholder(variable_name="agent_scratchpad"),
+            ]
+        )
+        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        return AgentExecutor(
+            agent=agent,
+            tools=self.tools,
+            verbose=False,
+            return_intermediate_steps=True,
+            handle_parsing_errors=True,
+        )
+
+    @staticmethod
+    def _extract_sources(intermediate_steps: list[Any]) -> list[str]:
+        found: list[str] = []
+        for _, observation in intermediate_steps:
+            if not isinstance(observation, str):
+                continue
+            try:
+                payload = json.loads(observation)
+            except json.JSONDecodeError:
+                continue
+            srcs = payload.get("sources", [])
+            if isinstance(srcs, list):
+                for s in srcs:
+                    txt = str(s).strip()
+                    if txt and txt not in found:
+                        found.append(txt)
+        return found
+
+    @staticmethod
+    def _used_skill(intermediate_steps: list[Any]) -> bool:
+        for action, _ in intermediate_steps:
+            if getattr(action, "tool", "") == "run_code_skill":
+                return True
+        return False
 
     def chat(self, message: str) -> dict[str, Any]:
         question = (message or "").strip()
@@ -237,8 +273,9 @@ class RagAssistant:
             if not sources and chunks:
                 sources = ["unknown"]
             return {"answer": answer, "sources": sources, "used_skill": True}
-        if self._should_summarize(question):
-            answer = str(self.tool_map["make_knowledge_card"].invoke({"query": question})).strip()
-            chunks, sources = self._retrieve(question)
-            return {"answer": answer, "sources": sources, "used_skill": False}
-        return self._qa_with_search_tool(question)
+        out = self.agent_executor.invoke({"input": question})
+        answer = str(out.get("output", "")).strip() or "暂时无法生成回答。"
+        steps = out.get("intermediate_steps", [])
+        sources = self._extract_sources(steps)
+        used_skill = self._used_skill(steps)
+        return {"answer": answer, "sources": sources, "used_skill": used_skill}
