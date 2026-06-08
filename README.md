@@ -40,7 +40,7 @@
 - **`vectorstore`**：`persist_dir`（Chroma 持久化）、`collection_name`。
 - **`rag`**：`chunk_size`、`chunk_overlap`、`top_k`。
 
-请自行将 `api_key` 等敏感信息填入本地配置，**不要将真实密钥提交到仓库**。
+
 
 ## 安装与运行
 
